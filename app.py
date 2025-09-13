@@ -1,374 +1,538 @@
 # app.py
+# Single-file Streamlit maze runner game
+
 import streamlit as st
+from random import randrange, choice, shuffle, randint
+from typing import List, Tuple, Dict
 
-st.set_page_config(page_title="Labirent Altın Oyunu", layout="wide")
+st.set_page_config(page_title="Maze Runner", layout="wide", initial_sidebar_state="expanded")
 
-# Constants for colors
-BG = "#0B1021"
-FLOOR = "#121826"
-WALL = "#263238"
-GOLD = "#FFD54F"
-PLAYER = "#26A69A"
+# --- Constants / Palette ---
+BG = "#E3F2FD"
+WALL_COLOR = "#000000"
+FLOOR = "#CFE6FF"
+GOLD_COLOR = "#FFD54F"
+PLAYER_COLOR = "#26A69A"
+EXIT_COLOR = "#66BB6A"
+MONSTER_COLOR = "#EF5350"
 
-# ------------------------------------------------------------------
-# Helpers and required functions
-# ------------------------------------------------------------------
+# --- Session state keys initialization ---
+if "level" not in st.session_state:
+    st.session_state["level"] = 1
+if "win_all" not in st.session_state:
+    st.session_state["win_all"] = False
+if "game_over" not in st.session_state:
+    st.session_state["game_over"] = False
 
-def _clamp(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, v))
+# Level-specific
+for k in ("maze", "px", "py", "steps_left", "gold_needed", "gold_collected", "exit_xy", "monsters"):
+    if k not in st.session_state:
+        st.session_state[k] = None
 
-class SimpleRNG:
-    """A tiny deterministic LCG RNG (no external imports)."""
-    def __init__(self, seed: int | None = None):
-        if seed is None:
-            # Try to get a varying seed using the object's id/hash
-            seed = abs(hash(str(id(object())))) & 0xFFFFFFFF
-        self.state = int(seed) & 0xFFFFFFFF
-    def rand(self) -> int:
-        # LCG parameters
-        self.state = (1664525 * self.state + 1013904223) & 0xFFFFFFFF
-        return self.state
-    def randrange(self, n: int) -> int:
-        if n <= 0:
-            return 0
-        return self.rand() % n
-    def choice(self, seq):
-        return seq[self.randrange(len(seq))]
+# Controls
+if "auto_run" not in st.session_state:
+    st.session_state["auto_run"] = False
+if "speed" not in st.session_state:
+    st.session_state["speed"] = 1
+if "last_dir" not in st.session_state:
+    st.session_state["last_dir"] = (0, 0)
+if "rounded" not in st.session_state:
+    st.session_state["rounded"] = True
+if "last_key" not in st.session_state:
+    st.session_state["last_key"] = ""
+if "cell_px" not in st.session_state:
+    st.session_state["cell_px"] = 28
 
-def in_bounds(w: int, h: int, x: int, y: int) -> bool:
-    """Return True if (x,y) is within grid bounds."""
-    return 0 <= x < w and 0 <= y < h
+# --- Utility / Game functions ---
 
-def empty_cells(maze: list[list[str]]) -> list[tuple[int,int]]:
-    """Return list of coordinates of floor cells (not walls)."""
-    res = []
-    h = len(maze)
-    w = len(maze[0]) if h else 0
-    for y in range(h):
-        for x in range(w):
-            if maze[y][x] == ' ':
-                res.append((x,y))
-    return res
 
-def place_items(maze: list[list[str]], cells: list[tuple[int,int]], rng: SimpleRNG, item: str, count: int):
-    """Place `item` into `count` random distinct cells from `cells`."""
-    if not cells or count <= 0:
-        return
-    available = cells[:]
-    placed = 0
-    while placed < count and available:
-        idx = rng.randrange(len(available))
-        x,y = available.pop(idx)
-        # avoid placing on already placed or non-floor
-        if maze[y][x] == ' ':
-            maze[y][x] = item
-            placed += 1
+def clamp(v: int, a: int, b: int) -> int:
+    return max(a, min(b, v))
 
-def make_maze(w: int, h: int) -> list[list[str]]:
+
+def neighbors4(x: int, y: int) -> List[Tuple[int, int]]:
+    return [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+
+
+def is_inside(maze: List[List[str]], x: int, y: int) -> bool:
+    return 0 <= y < len(maze) and 0 <= x < len(maze[0])
+
+
+def is_floor(maze: List[List[str]], x: int, y: int) -> bool:
+    return is_inside(maze, x, y) and maze[y][x] != "#"
+
+
+def find_all_floor(maze: List[List[str]]) -> List[Tuple[int, int]]:
+    floors = []
+    for y in range(len(maze)):
+        for x in range(len(maze[0])):
+            if maze[y][x] != "#":
+                floors.append((x, y))
+    return floors
+
+
+def manhattan(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def ensure_odd(n: int) -> int:
+    return n if n % 2 == 1 else n - 1 if n > 1 else 1
+
+
+def make_maze(w: int, h: int) -> List[List[str]]:
     """
     make_maze(w: int, h: int) -> list[list[str]]
-    Create a maze using an iterative recursive backtracker.
-    Cells: '#' wall, ' ' floor.
-    w,h are expected odd; function will work best with odd sizes.
+    Generate a maze using recursive backtracker. '#' are walls, ' ' are floors.
     """
-    # Ensure odd sizes
-    if w % 2 == 0:
-        w = max(3, w - 1)
-    if h % 2 == 0:
-        h = max(3, h - 1)
-
-    # Initialize full walls
-    maze = [['#' for _ in range(w)] for __ in range(h)]
-    rng = SimpleRNG(None)
-
-    # Start at random odd cell
-    start_x = 1
-    start_y = 1
-    maze[start_y][start_x] = ' '
-    stack = [(start_x, start_y)]
-
+    w = ensure_odd(w)
+    h = ensure_odd(h)
+    maze = [["#"] * w for _ in range(h)]
+    stack = []
+    sx = randrange(1, w, 2)
+    sy = randrange(1, h, 2)
+    maze[sy][sx] = " "
+    stack.append((sx, sy))
     while stack:
         x, y = stack[-1]
-        # Neighbours two steps away
-        neigh = []
-        for dx, dy in ((2,0),(-2,0),(0,2),(0,-2)):
-            nx, ny = x+dx, y+dy
-            if 1 <= nx < w-1 and 1 <= ny < h-1 and maze[ny][nx] == '#':
-                neigh.append((nx, ny, dx//2, dy//2))
-        if neigh:
-            nx, ny, mx, my = rng.choice(neigh)
-            # Carve
-            maze[y+my][x+mx] = ' '
-            maze[ny][nx] = ' '
+        nbrs = []
+        for dx, dy in [(2, 0), (-2, 0), (0, 2), (0, -2)]:
+            nx, ny = x + dx, y + dy
+            if 1 <= nx < w - 1 and 1 <= ny < h - 1 and maze[ny][nx] == "#":
+                nbrs.append((nx, ny, dx // 2, dy // 2))
+        if nbrs:
+            nx, ny, ox, oy = choice(nbrs)
+            maze[y + oy][x + ox] = " "
+            maze[ny][nx] = " "
             stack.append((nx, ny))
         else:
             stack.pop()
     return maze
 
-def count_gold(maze: list[list[str]]) -> int:
-    """count_gold(maze: list[list[str]]) -> int: return number of gold cells."""
-    return sum(1 for row in maze for c in row if c == 'G')
 
-def move_if_possible(maze: list[list[str]], px: int, py: int, dx: int, dy: int) -> tuple[int,int,int]:
+def move_if_possible(maze: List[List[str]], px: int, py: int, dx: int, dy: int, *, speed: int = 1) -> Tuple[int, int, int]:
     """
-    move_if_possible(maze: list[list[str]], px: int, py: int, dx: int, dy: int) -> tuple[int,int,int]
-    Try to move the player by (dx,dy). Returns (new_px, new_py, gained_score).
-    If move blocked by wall or out of bounds, returns original pos and 0.
-    If moves onto gold, returns gained_score 10 and clears the gold cell.
+    move_if_possible(maze, px, py, dx, dy, *, speed=1) -> (new_px, new_py, gold_collected_this_move)
+    Attempt to move up to 'speed' steps in direction (dx,dy). Stop if hitting a wall. Collect gold if encountered.
     """
-    w = len(maze[0])
-    h = len(maze)
-    nx, ny = px + dx, py + dy
-    if not in_bounds(w,h,nx,ny):
-        return px, py, 0
-    if maze[ny][nx] == '#':
-        return px, py, 0
-    gained = 0
-    if maze[ny][nx] == 'G':
-        gained = 10
-        maze[ny][nx] = ' '
-    return nx, ny, gained
+    gold = 0
+    steps = clamp(speed, 1, 10)
+    nx, ny = px, py
+    for _ in range(steps):
+        tx, ty = nx + dx, ny + dy
+        if not is_inside(maze, tx, ty) or maze[ty][tx] == "#":
+            break
+        nx, ny = tx, ty
+        if maze[ny][nx] == "G":
+            gold += 1
+            maze[ny][nx] = " "
+    return nx, ny, gold
 
-def init_game(w: int, h: int, gold_count: int, step_limit: int, seed: int | None = None) -> dict[str, object]:
+
+def count_gold(maze: List[List[str]]) -> int:
+    """count_gold(maze) -> int : count gold pieces 'G' in the maze."""
+    c = 0
+    for row in maze:
+        for ch in row:
+            if ch == "G":
+                c += 1
+    return c
+
+
+def compute_level_params(level: int) -> Dict[str, int]:
     """
-    init_game(w: int, h: int, gold_count: int, step_limit: int, seed: int | None = None) -> dict[str, object]
-    Initialize a new game state dictionary. Ensures required session_state keys are present.
+    compute_level_params(level) -> dict with keys: w,h,steps,gold_needed,gold_total,monster_count
+    Derive parameters scaling with level.
     """
-    # sanitize inputs
-    try:
-        seed_val = int(seed) if seed is not None and str(seed).strip() != '' else None
-    except Exception:
-        seed_val = None
+    base_w, base_h = 19, 11
+    # Increase size every 3 levels
+    inc = (level - 1) // 3 * 2
+    w = base_w + inc
+    h = base_h + inc
+    w = ensure_odd(w)
+    h = ensure_odd(h)
+    # Steps: start ~150 reduce 3-5 per level
+    steps = max(40, 150 - sum(randint(3, 5) for _ in range(level - 1)))
+    # Gold needed: start 3, +1 (sometimes +2)
+    gold_needed = 3 + (level - 1)
+    # Total gold: at least gold_needed + 2
+    gold_total = gold_needed + 2 + (level // 5)
+    # Monster count scale
+    if level <= 2:
+        monster_count = 0
+    elif level <= 7:
+        monster_count = 1
+    elif level <= 14:
+        monster_count = 2
+    else:
+        monster_count = 3
+    return {"w": w, "h": h, "steps": steps, "gold_needed": gold_needed, "gold_total": gold_total, "monster_count": monster_count}
 
-    w = int(w)
-    h = int(h)
-    # ensure odd
-    if w % 2 == 0:
-        w = w - 1 if w > 3 else 3
-    if h % 2 == 0:
-        h = h - 1 if h > 3 else 3
 
-    step_limit = _clamp(int(step_limit), 1, 100000)
-    rng = SimpleRNG(seed_val)
-
-    # create maze
-    maze = make_maze(w, h)
-
-    # place gold on empty cells
-    empties = empty_cells(maze)
-    max_gold = len(empties)
-    desired = int(gold_count)
-    if desired < 0:
-        desired = 0
-    desired = min(desired, max_gold)
-    place_items(maze, empties, rng, 'G', desired)
-
-    # place player: try (1,1) else first empty
-    px, py = 1,1
-    if not in_bounds(w,h,px,py) or maze[py][px] == '#':
-        empt = empty_cells(maze)
-        if empt:
-            px,py = empt[0]
-        else:
-            # fallback: carve start
-            px,py = 1,1
-            if in_bounds(w,h,px,py):
-                maze[py][px] = ' '
-
-    state = {
-        "maze": maze,
-        "px": int(px),
-        "py": int(py),
-        "score": 0,
-        "steps_left": int(step_limit),
-        "game_over": False,
-        "win": False,
-        "seed_used": seed_val
-    }
-    return state
-
-def render_grid_html(maze: list[list[str]], px: int, py: int, *, cell_px: int = 28, rounded: bool = True, show_coords: bool = False) -> str:
+def init_level(level: int) -> Dict[str, object]:
     """
-    render_grid_html(maze: list[list[str]], px: int, py: int, *, cell_px: int = 28, rounded: bool = True, show_coords: bool = False) -> str
-    Render the maze as an inline-styled CSS grid and return HTML string.
+    init_level(level) -> dict[str, object]
+    Initialize a level: generate maze, place player, exit, golds and monsters. Returns a dict with initial state.
     """
-    h = len(maze)
-    w = len(maze[0]) if h else 0
-    gap = 4
-    radius = f"{max(2, int(cell_px*0.12))}px" if rounded else "2px"
-    container_style = (
-        f"display:grid; grid-template-columns: repeat({w}, {cell_px}px); "
-        f"grid-auto-rows: {cell_px}px; gap:4px; background:{BG}; padding:8px; "
-        f"border-radius:8px; width: max-content;"
-    )
-    cell_html_parts = [f'<div style="{container_style}">']
-    for y in range(h):
-        for x in range(w):
+    params = compute_level_params(level)
+    attempt = 0
+    while True:
+        attempt += 1
+        maze = make_maze(params["w"], params["h"])
+        floors = find_all_floor(maze)
+        if len(floors) < 5:
+            continue
+        start = choice(floors)
+        exit_cell = choice(floors)
+        if manhattan(start, exit_cell) < params["w"] // 2:
+            continue
+        # Place gold avoiding start/exit
+        available = [c for c in floors if c != start and c != exit_cell]
+        shuffle(available)
+        gold_positions = available[: params["gold_total"]]
+        for gx, gy in gold_positions:
+            maze[gy][gx] = "G"
+        # Monsters
+        monster_positions = []
+        available_m = [c for c in available if c not in gold_positions]
+        shuffle(available_m)
+        for i in range(min(params["monster_count"], len(available_m))):
+            monster_positions.append(available_m[i])
+        # Assign exit marker (not to collide with gold/monsters)
+        ex, ey = exit_cell
+        maze[ey][ex] = " "
+        # Done
+        return {
+            "maze": maze,
+            "px": start[0],
+            "py": start[1],
+            "steps_left": params["steps"],
+            "gold_needed": params["gold_needed"],
+            "gold_collected": 0,
+            "exit_xy": (ex, ey),
+            "monsters": monster_positions,
+        }
+
+
+def render_grid_html(maze: List[List[str]], px: int, py: int, exit_xy: Tuple[int, int], monsters: List[Tuple[int, int]], *, cell_px: int = 28, rounded: bool = True) -> str:
+    """
+    render_grid_html(maze, px, py, exit_xy, monsters, *, cell_px=28, rounded=True) -> str
+    Render the maze as an HTML string using a CSS grid. Uses the defined color palette and emojis.
+    """
+    rows = len(maze)
+    cols = len(maze[0]) if rows else 0
+    border_radius = "8px" if rounded else "2px"
+    html = f"""<div style="background:{BG};padding:8px;border-radius:8px;display:inline-block;">
+    <div style="display:grid;grid-template-columns:repeat({cols},{cell_px}px);grid-auto-rows:{cell_px}px;gap:4px;">"""
+    mon_set = set(monsters)
+    ex, ey = exit_xy
+    for y in range(rows):
+        for x in range(cols):
             ch = maze[y][x]
-            title = "Floor"
-            bg = FLOOR
-            content = "&nbsp;"
-            color = "#ffffff"
-            if ch == '#':
-                bg = WALL
-                title = "Wall"
-                content = "&nbsp;"
-            elif ch == 'G':
-                bg = GOLD
-                title = "Gold"
-                content = "★"
-                color = "#2b2b2b"
+            style = f"width:{cell_px}px;height:{cell_px}px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(0,0,0,0.08);border-radius:{border_radius};font-size:{int(cell_px*0.6)}px;"
+            if (x, y) == (px, py):
+                cell_html = f'<div title="You" style="{style}background:{PLAYER_COLOR};color:white;">🏃</div>'
+            elif (x, y) == (ex, ey):
+                cell_html = f'<div title="EXIT" style="{style}background:{EXIT_COLOR};color:white;">⛳</div>'
+            elif (x, y) in mon_set:
+                cell_html = f'<div title="Monster" style="{style}background:{MONSTER_COLOR};color:white;">😈</div>'
+            elif ch == "#":
+                cell_html = f'<div style="{style}background:{WALL_COLOR};"></div>'
+            elif ch == "G":
+                cell_html = f'<div title="Gold" style="{style}background:{FLOOR};color:{GOLD_COLOR};font-weight:bold;">★</div>'
             else:
-                bg = FLOOR
-                title = "Floor"
-                content = "&nbsp;"
-            if x == px and y == py:
-                bg = PLAYER
-                title = "Player"
-                content = "🏃"
-                color = "#021"  # not used much; emoji is primary
+                cell_html = f'<div style="{style}background:{FLOOR};"></div>'
+            html += cell_html
+    html += "</div></div>"
+    return html
 
-            aria = title
-            style = (
-                f"width:{cell_px}px; height:{cell_px}px; background:{bg}; "
-                f"border-radius:{radius}; display:flex; align-items:center; justify-content:center; "
-                f"font-size:{max(12, int(cell_px*0.6))}px; color:{color}; "
-                f"box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);"
-            )
-            coord_text = f' data-coord="{x},{y}"' if show_coords else ""
-            title_attr = f'title="{title}" aria-label="{aria}"'
-            cell_html_parts.append(f'<div {title_attr} {coord_text} style="{style}">{content}</div>')
-    cell_html_parts.append("</div>")
-    return "".join(cell_html_parts)
 
-# ------------------------------------------------------------------
-# UI and game loop (single-interaction per run)
-# ------------------------------------------------------------------
+def step_monsters(maze: List[List[str]], monsters: List[Tuple[int, int]], px: int, py: int) -> Tuple[List[Tuple[int, int]], int]:
+    """
+    step_monsters(maze, monsters, px, py) -> (new_monsters, penalty)
+    Move each monster one random step into adjacent floor cell (no passing walls). If a monster enters the player cell, penalty -1.
+    """
+    new_positions = []
+    occupied = set(monsters)
+    penalty = 0
+    order = list(range(len(monsters)))
+    shuffle(order)
+    for i in order:
+        mx, my = monsters[i]
+        choices = []
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nx, ny = mx + dx, my + dy
+            if is_inside(maze, nx, ny) and maze[ny][nx] != "#" and (nx, ny) not in occupied:
+                choices.append((nx, ny))
+        if choices:
+            nx, ny = choice(choices)
+        else:
+            nx, ny = mx, my
+        occupied.discard((mx, my))
+        occupied.add((nx, ny))
+        new_positions.append((nx, ny))
+        if (nx, ny) == (px, py):
+            penalty -= 1
+    # ensure penalty doesn't lower below zero externally
+    return new_positions, penalty
 
-# Sidebar settings
-st.sidebar.header("Ayarlar")
-width = st.sidebar.number_input("Genişlik", min_value=15, max_value=51, value=21, step=2)
-height = st.sidebar.number_input("Yükseklik", min_value=9, max_value=31, value=15, step=2)
-gold_cnt = st.sidebar.number_input("Altın sayısı", min_value=1, max_value=200, value=15, step=1)
-step_limit = st.sidebar.number_input("Adım limiti", min_value=10, max_value=1000, value=300, step=10)
-seed_input = st.sidebar.text_input("Seed (opsiyonel int)", value="")
-cell_px = st.sidebar.slider("Hücre boyutu", min_value=18, max_value=48, value=28, step=1)
-rounded = st.sidebar.checkbox("Rounded hücreler", value=True)
-show_coords = st.sidebar.checkbox("Koordinatları göster", value=False)
 
-# clamp and coerce
-try:
-    seed_val = int(seed_input) if seed_input.strip() != "" else None
-except Exception:
-    seed_val = None
+# --- Initialization / Level handling ---
+def load_level(level: int):
+    """Load or initialize a level into session_state."""
+    lvl_data = init_level(level)
+    st.session_state["maze"] = lvl_data["maze"]
+    st.session_state["px"] = lvl_data["px"]
+    st.session_state["py"] = lvl_data["py"]
+    st.session_state["steps_left"] = lvl_data["steps_left"]
+    st.session_state["gold_needed"] = lvl_data["gold_needed"]
+    st.session_state["gold_collected"] = lvl_data["gold_collected"]
+    st.session_state["exit_xy"] = lvl_data["exit_xy"]
+    st.session_state["monsters"] = lvl_data["monsters"]
+    st.session_state["game_over"] = False
+    st.session_state["auto_run"] = False
+    st.session_state["last_dir"] = (0, 0)
 
-width = int(width); height = int(height)
-# enforce odd sizes
-if width % 2 == 0:
-    width = max(3, width-1)
-if height % 2 == 0:
-    height = max(3, height-1)
 
-gold_cnt = _clamp(int(gold_cnt), 0, 10000)
-step_limit = _clamp(int(step_limit), 1, 100000)
+if st.session_state["maze"] is None:
+    load_level(st.session_state["level"])
 
-# Initialize session state defaults
-if "maze" not in st.session_state:
-    initial = init_game(width, height, gold_cnt, step_limit, seed_val)
-    for k,v in initial.items():
-        st.session_state[k] = v
 
-# Buttons to start new game or randomize
-col_buttons = st.columns([1,1,2])
-with col_buttons[0]:
-    if st.button("Yeni Oyun (aynı seed)"):
-        seed_for = st.session_state.get("seed_used", seed_val)
-        new_state = init_game(width, height, gold_cnt, step_limit, seed_for)
-        for k,v in new_state.items():
-            st.session_state[k] = v
-        st.rerun()
-with col_buttons[1]:
-    if st.button("Rastgele Labirent"):
-        new_state = init_game(width, height, gold_cnt, step_limit, None)
-        for k,v in new_state.items():
-            st.session_state[k] = v
-        st.rerun()
-with col_buttons[2]:
-    st.markdown(f"<div style='color:#ddd'>Seed: {st.session_state.get('seed_used')}</div>", unsafe_allow_html=True)
+# --- Keyboard capture via components.html ---
+kbd_html = """
+<div tabindex="0" id="kbd_div" style="outline:none;"></div>
+<script>
+const target = document.getElementById("kbd_div");
+target.focus();
+function sendKey(k){
+    // Post message in a structure streamlit might pick up; many Streamlit deployments forward postMessage payloads to the python iframe wrapper.
+    window.parent.postMessage({type:'st_keydown', key: k}, "*");
+}
+window.addEventListener("keydown", (e) => {
+    const key = e.key;
+    sendKey(key);
+});
+</script>
+"""
+# Render invisible component to capture keys
+st.components.v1.html(kbd_html, height=0, scrolling=False)
 
-# Helper to process moves
-def process_move(dx:int, dy:int):
+
+# Attempt to read messages forwarded to session_state via query parameters from the browser (best-effort):
+# Some Streamlit frontends forward postMessage payloads to the python side via window.postMessage protocol.
+# We'll inspect st.session_state["last_key"] if any component updated it previously.
+# To be conservative, we also provide on-screen buttons that always work.
+
+# JS -> Python bridging: We attempt to check for posted messages via a small polling iframe approach.
+# Create an HTML component which, when it receives parent postMessage, sets its document.title,
+# and the Streamlit backend may capture and return that value; this is a best-effort fallback.
+bridge_html = """
+<script>
+window.addEventListener("message", (e) => {
+    if (!e.data) return;
+    try {
+        if (e.data.type === 'st_keydown' && e.data.key) {
+            // expose via document.title so Streamlit frontend can pick it up on rerender cycles
+            document.title = 'st_last_key:' + e.data.key + ':' + Date.now();
+        }
+    } catch (err) {}
+}, false);
+</script>
+"""
+st.components.v1.html(bridge_html, height=0)
+
+
+# Check document.title hack: Some frontends propagate title -> st.experimental_get_query_params is not reliable.
+# But we can still read an incoming key from st.session_state if any custom integration set it.
+# We'll check st.session_state["last_key"] to see if set by prior runs (component may not set it).
+incoming_key = st.session_state.get("last_key", "")
+
+# --- Controls UI ---
+with st.sidebar:
+    st.markdown(f"<div style='background:{BG};padding:8px;border-radius:8px;'>", unsafe_allow_html=True)
+    st.header("Maze Runner")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("Controls: Arrow keys or W/A/S/D, or use the buttons below.")
+    st.session_state["cell_px"] = st.slider("Cell size (px)", 18, 48, st.session_state["cell_px"], step=2)
+    st.session_state["rounded"] = st.checkbox("Rounded cells", st.session_state["rounded"])
+    st.session_state["speed"] = st.slider("Speed multiplier", 1, 5, st.session_state["speed"])
+    st.session_state["auto_run"] = st.checkbox("Auto-Run", st.session_state["auto_run"])
+    st.markdown("---")
+    if st.button("Restart Level"):
+        load_level(st.session_state["level"])
+        st.experimental_rerun()
+    if st.button("Restart Game (Level 1)"):
+        st.session_state["level"] = 1
+        load_level(1)
+        st.experimental_rerun()
+    st.markdown("Tips: Auto-Run will continue moving each rerun. Use stop to halt.")
+    st.markdown("Rounded corners, speed and cell size affect visuals.")
+    st.markdown("---")
+    st.markdown("Goal: Reach EXIT and collect required gold within steps.")
+    st.markdown(f"Levels: 1 .. 20 (current: {st.session_state['level']})")
+
+
+# --- Helper to process a movement action ---
+def process_move(dx: int, dy: int):
     if st.session_state["game_over"]:
         return
     maze = st.session_state["maze"]
     px = st.session_state["px"]
     py = st.session_state["py"]
-    new_px, new_py, gained = move_if_possible(maze, px, py, dx, dy)
-    moved = not (new_px == px and new_py == py)
-    if moved:
-        st.session_state["px"] = int(new_px)
-        st.session_state["py"] = int(new_py)
-        st.session_state["score"] += int(gained)
-        st.session_state["steps_left"] = max(0, st.session_state["steps_left"] - 1)
-    # Check win/lose
-    remaining_gold = count_gold(st.session_state["maze"])
-    if remaining_gold <= 0:
-        st.session_state["game_over"] = True
-        st.session_state["win"] = True
-    elif st.session_state["steps_left"] <= 0:
-        st.session_state["game_over"] = True
-        st.session_state["win"] = False
+    speed = clamp(int(st.session_state["speed"]), 1, 5)
+    nx, ny, gold = move_if_possible(maze, px, py, dx, dy, speed=speed)
+    st.session_state["px"], st.session_state["py"] = nx, ny
+    st.session_state["gold_collected"] = max(0, st.session_state["gold_collected"] + gold)
+    st.session_state["steps_left"] = max(0, st.session_state["steps_left"] - (abs(nx - px) + abs(ny - py) or 1))
+    # Monsters move after player
+    monsters, penalty = step_monsters(maze, st.session_state["monsters"], st.session_state["px"], st.session_state["py"])
+    st.session_state["monsters"] = monsters
+    if penalty < 0:
+        st.session_state["gold_collected"] = max(0, st.session_state["gold_collected"] + penalty)
+    # Auto-run direction
+    st.session_state["last_dir"] = (dx, dy)
+    # Check for gold on current cell (in case stayed)
+    if maze[st.session_state["py"]][st.session_state["px"]] == "G":
+        st.session_state["gold_collected"] += 1
+        maze[st.session_state["py"]][st.session_state["px"]] = " "
+    # Check for level completion
+    ex, ey = st.session_state["exit_xy"]
+    if (st.session_state["px"], st.session_state["py"]) == (ex, ey) and st.session_state["gold_collected"] >= st.session_state["gold_needed"]:
+        # Advance level or win
+        if st.session_state["level"] >= 20:
+            st.session_state["win_all"] = True
+            st.session_state["game_over"] = True
+        else:
+            st.session_state["level"] += 1
+            load_level(st.session_state["level"])
+    # Check steps out
+    if st.session_state["steps_left"] <= 0:
+        if st.session_state["gold_collected"] >= st.session_state["gold_needed"] and (st.session_state["px"], st.session_state["py"]) == (ex, ey):
+            # already handled
+            pass
+        else:
+            st.session_state["game_over"] = True
 
-# Direction buttons
-dir_cols = st.columns([1,1,1])
-with dir_cols[0]:
-    if st.button("⬆️"):
-        process_move(0,-1)
-        st.rerun()
-with dir_cols[1]:
-    if st.button("⬅️"):
-        process_move(-1,0)
-        st.rerun()
-with dir_cols[2]:
-    if st.button("➡️"):
-        process_move(1,0)
-        st.rerun()
-dir2 = st.columns([1,1,1])
-with dir2[0]:
-    if st.button("⬇️"):
-        process_move(0,1)
-        st.rerun()
 
-# Keyboard input via text_input
-key = st.text_input("W/A/S/D ile hareket et (Enter sonra temizlenir)", key="key_input")
+# Movement buttons handlers
+def move_up():
+    process_move(0, -1)
+
+
+def move_down():
+    process_move(0, 1)
+
+
+def move_left():
+    process_move(-1, 0)
+
+
+def move_right():
+    process_move(1, 0)
+
+
+# --- Top metrics / Game rendering ---
+col1, col2, col3 = st.columns([1, 2, 1])
+with col1:
+    st.metric("Level", f"{st.session_state['level']}/20")
+with col2:
+    st.markdown(
+        f"<div style='background:{BG};padding:8px;border-radius:8px;display:flex;gap:12px;justify-content:center;'>"
+        f"<div>Steps Left: <b>{st.session_state['steps_left']}</b></div>"
+        f"<div>Gold: <b>{st.session_state['gold_collected']}</b> / {st.session_state['gold_needed']}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+with col3:
+    st.checkbox("Auto-Run (start/stop)", value=st.session_state["auto_run"], key="auto_run_sidebar")
+
+# Main area: grid and controls
+maze = st.session_state["maze"]
+px = st.session_state["px"]
+py = st.session_state["py"]
+exit_xy = st.session_state["exit_xy"]
+monsters = st.session_state["monsters"]
+
+grid_html = render_grid_html(maze, px, py, exit_xy, monsters, cell_px=st.session_state["cell_px"], rounded=st.session_state["rounded"])
+st.markdown(grid_html, unsafe_allow_html=True)
+
+# Controls row
+c1, c2, c3 = st.columns([1, 2, 1])
+with c2:
+    col_up, col_middle, col_down = st.columns(3)
+    with col_up:
+        if st.button("⬆️") or (incoming_key in ("ArrowUp", "w", "W")):
+            process_move(0, -1)
+    with col_middle:
+        left_col, mid_col, right_col = st.columns(3)
+        with left_col:
+            if st.button("⬅️") or (incoming_key in ("ArrowLeft", "a", "A")):
+                process_move(-1, 0)
+        with mid_col:
+            if st.button("⏹ Stop"):
+                st.session_state["auto_run"] = False
+                st.session_state["last_dir"] = (0, 0)
+        with right_col:
+            if st.button("➡️") or (incoming_key in ("ArrowRight", "d", "D")):
+                process_move(1, 0)
+    with col_down:
+        if st.button("⬇️") or (incoming_key in ("ArrowDown", "s", "S")):
+            process_move(0, 1)
+
+# If incoming_key present, map to actions
+key = incoming_key
 if key:
-    k = key.strip().lower()
-    if k:
-        mapping = {'w':(0,-1),'a':(-1,0),'s':(0,1),'d':(1,0)}
-        if k[0] in mapping:
-            dx,dy = mapping[k[0]]
-            process_move(dx,dy)
-    # Clear input and rerun to maintain single keystroke behaviour
-    st.session_state["key_input"] = ""
-    st.rerun()
+    k = key
+    if k in ("ArrowUp", "w", "W"):
+        process_move(0, -1)
+    elif k in ("ArrowDown", "s", "S"):
+        process_move(0, 1)
+    elif k in ("ArrowLeft", "a", "A"):
+        process_move(-1, 0)
+    elif k in ("ArrowRight", "d", "D"):
+        process_move(1, 0)
+    # clear to avoid repeated unintended moves
+    st.session_state["last_key"] = ""
 
-# Display metrics
-col1, col2, col3 = st.columns(3)
-col1.metric("Skor", st.session_state["score"])
-col2.metric("Kalan Adım", st.session_state["steps_left"])
-col3.metric("Kalan Altın", count_gold(st.session_state["maze"]))
-
-# Render maze
-html = render_grid_html(st.session_state["maze"], st.session_state["px"], st.session_state["py"],
-                        cell_px=cell_px, rounded=rounded, show_coords=show_coords)
-st.markdown(html, unsafe_allow_html=True)
-
-# End game messages
-if st.session_state["game_over"]:
-    if st.session_state["win"]:
-        st.success(f"Tebrikler! Tüm altınları topladınız. Skor: {st.session_state['score']}")
+# Auto-run handling: continue moving in last_dir each rerun
+if st.session_state["auto_run"]:
+    dx, dy = st.session_state.get("last_dir", (0, 0))
+    if dx == 0 and dy == 0:
+        # need a direction; default to right
+        dx, dy = (1, 0)
+        st.session_state["last_dir"] = (dx, dy)
+    # perform a move, then request rerun to continue looping
+    process_move(dx, dy)
+    # small guard: stop auto-run if game over or steps exhausted
+    if st.session_state["game_over"] or st.session_state["win_all"]:
+        st.session_state["auto_run"] = False
     else:
-        st.error(f"Oyunu kaybettiniz. Adımlar bitti. Kalan altın: {count_gold(st.session_state['maze'])}")
+        # rerun to continue auto-run loop
+        st.rerun()
 
-# Footer small instructions
-st.markdown("""<div style="color:#aaa">Kontroller: butonlar veya klavye (w/a/s/d). Yeni oyun butonları sidebar ayarlarına göre çalışır.</div>""", unsafe_allow_html=True)
+# Game over / level fail handling and messages
+if st.session_state["win_all"]:
+    st.success("Congratulations! You completed all 20 levels! 🎉")
+    if st.button("Play Again"):
+        st.session_state["level"] = 1
+        load_level(1)
+        st.experimental_rerun()
+elif st.session_state["game_over"]:
+    st.warning("Level Failed! Out of steps or conditions not met.")
+    if st.button("Retry Level"):
+        load_level(st.session_state["level"])
+        st.experimental_rerun()
+    if st.button("Go to Next Level (force)"):
+        if st.session_state["level"] < 20:
+            st.session_state["level"] += 1
+            load_level(st.session_state["level"])
+            st.experimental_rerun()
+
+# Footer: show some diagnostics
+st.markdown("---")
+st.markdown(
+    f"<div style='font-size:12px;color:#333;'>Monsters: {len(st.session_state['monsters'])} | Total gold left in maze: {count_gold(st.session_state['maze'])}</div>",
+    unsafe_allow_html=True,
+)
+
+# Ensure gold_collected never negative
+st.session_state["gold_collected"] = max(0, int(st.session_state["gold_collected"]))
